@@ -1,11 +1,11 @@
-import sys, os, subprocess, math, textwrap
+import sys, os, subprocess, math, textwrap, time
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QListWidget, QComboBox,
     QLabel, QFileDialog, QTextEdit, QSpinBox
 )
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QTextCursor
 from PySide6.QtCore import QUrl
 
 
@@ -65,8 +65,14 @@ class VideoTool(QMainWindow):
         self.res_combo.setCurrentText("1080")
 
         self.layout_combo = QComboBox()
-        self.layout_combo.addItems(["Grid (Max 2 Cols)", "Single Row"])
-        self.layout_combo.setCurrentText("Single Row")
+        self.layout_combo.addItems([
+            "1 Row",
+            "2 Rows",
+            "3 Rows",
+            "4 Rows",
+            "Auto (Up to 4 Rows)",
+        ])
+        self.layout_combo.setCurrentText("2 Rows")
 
         self.aspect_combo = QComboBox()
         self.aspect_combo.addItems([
@@ -76,8 +82,17 @@ class VideoTool(QMainWindow):
         ])
         self.aspect_combo.setCurrentText("9:16 (Portrait)")
 
+        self.res_mode_combo = QComboBox()
+        self.res_mode_combo.addItems([
+            "Final Canvas Height",
+            "Per-Tile Height (Clearer)",
+        ])
+        self.res_mode_combo.setCurrentText("Per-Tile Height (Clearer)")
+
         row1.addWidget(QLabel("Output Height:"))
         row1.addWidget(self.res_combo)
+        row1.addWidget(QLabel("Resolution Mode:"))
+        row1.addWidget(self.res_mode_combo)
         row1.addWidget(QLabel("Layout:"))
         row1.addWidget(self.layout_combo)
         row1.addWidget(QLabel("Tile Aspect:"))
@@ -104,6 +119,13 @@ class VideoTool(QMainWindow):
         row2.addWidget(self.fit_combo)
         row2.addWidget(QLabel("Text Mode:"))
         row2.addWidget(self.text_mode_combo)
+
+        row2.addWidget(QLabel("Max per Row:"))
+        self.max_per_row_spin = QSpinBox()
+        self.max_per_row_spin.setRange(1, 40)
+        self.max_per_row_spin.setValue(10)
+        row2.addWidget(self.max_per_row_spin)
+
         settings_grid.addLayout(row2)
 
         row3 = QHBoxLayout()
@@ -154,9 +176,11 @@ class VideoTool(QMainWindow):
         layout.addLayout(action_hbox)
 
         self.res_combo.currentTextChanged.connect(self.update_resolution_preview)
+        self.res_mode_combo.currentTextChanged.connect(self.update_resolution_preview)
         self.layout_combo.currentTextChanged.connect(self.update_resolution_preview)
         self.aspect_combo.currentTextChanged.connect(self.update_resolution_preview)
         self.text_mode_combo.currentTextChanged.connect(self.update_resolution_preview)
+        self.max_per_row_spin.valueChanged.connect(self.update_resolution_preview)
         self.font_spin.valueChanged.connect(self.update_resolution_preview)
         self.file_list.model().rowsInserted.connect(lambda *args: self.update_resolution_preview())
         self.file_list.model().rowsRemoved.connect(lambda *args: self.update_resolution_preview())
@@ -249,46 +273,111 @@ class VideoTool(QMainWindow):
             "1376:1760 (Old)": (1376, 1760),
         }
 
-        target_h = self.force_even(self.res_combo.currentText())
-        num = max(len(self.files), 1)
-        mode = self.layout_combo.currentText()
-        rows = 1 if mode == "Single Row" else math.ceil(num / 2)
-        cols_per_row = num if mode == "Single Row" else 2
+        selected_h = self.force_even(self.res_combo.currentText())
+        clip_count = len(self.files)
+        num = max(clip_count, 1)
 
-        tile_h = self.force_even(target_h / rows)
+        mode = self.layout_combo.currentText()
+        max_per_row = self.max_per_row_spin.value()
+
+        if mode == "Auto (Up to 4 Rows)":
+            rows = max(1, min(4, math.ceil(num / max_per_row)))
+        else:
+            rows = int(mode.split()[0])
+
+        rows = max(1, min(4, rows))
+        cols_per_row = min(max_per_row, num)
+
+        row_counts = []
+        remaining = clip_count
+        for _ in range(rows):
+            if remaining <= 0:
+                break
+            count = min(max_per_row, remaining)
+            row_counts.append(count)
+            remaining -= count
+
+        overflow = max(0, clip_count - rows * max_per_row)
+
         ar_w, ar_h = aspect_map[self.aspect_combo.currentText()]
-        tile_w = self.force_even(tile_h * (ar_w / ar_h))
 
         font_size = self.font_spin.value()
         text_mode = self.text_mode_combo.currentText()
+
+        resolution_mode = self.res_mode_combo.currentText()
+        if resolution_mode == "Per-Tile Height (Clearer)":
+            tile_h = selected_h
+        else:
+            tile_h = self.force_even(selected_h / rows)
+
         header_h = self.force_even(max(font_size * 2 + 20, 36)) if text_mode == "Top of Video" else 0
+        tile_w = self.force_even(tile_h * (ar_w / ar_h))
         box_h = tile_h + header_h
 
-        canvas_w = tile_w * cols_per_row
-        canvas_h = box_h * rows
-
-        if mode == "Grid (Max 2 Cols)" and len(self.files) > 0:
-            canvas_w = tile_w * min(2, len(self.files))
+        max_cols_used = max(row_counts) if row_counts else min(max_per_row, num)
+        canvas_w = tile_w * max_cols_used
+        canvas_h = box_h * max(1, len(row_counts) if row_counts else rows)
 
         return {
             "rows": rows,
             "cols_per_row": cols_per_row,
+            "max_per_row": max_per_row,
+            "row_counts": row_counts,
             "tile_w": tile_w,
             "tile_h": tile_h,
             "header_h": header_h,
             "box_h": box_h,
             "canvas_w": canvas_w,
             "canvas_h": canvas_h,
+            "overflow": overflow,
+            "resolution_mode": resolution_mode,
+            "selected_h": selected_h,
         }
 
     def update_resolution_preview(self):
         m = self.get_layout_metrics()
         header_text = f" + {m['header_h']} px header" if m["header_h"] > 0 else ""
         clip_count = len(self.files)
+        row_text = " / ".join(str(x) for x in m["row_counts"]) if m["row_counts"] else "0"
+        overflow_text = f"   |   Overflow: {m['overflow']} clip(s) won't fit" if m["overflow"] > 0 else ""
+        mode_label = "Canvas" if m["resolution_mode"] == "Final Canvas Height" else "Per-tile"
         self.resolution_info_label.setText(
-            f"Clips: {clip_count}   |   Final output: {m['canvas_w']}x{m['canvas_h']}   |   "
-            f"Each video tile: {m['tile_w']}x{m['tile_h']}{header_text}"
+            f"Clips: {clip_count}   |   Mode: {mode_label} {m['selected_h']} px   |   "
+            f"Final output: {m['canvas_w']}x{m['canvas_h']}   |   "
+            f"Each video tile: {m['tile_w']}x{m['tile_h']}{header_text}   |   "
+            f"Max/row: {m['max_per_row']}   |   Row distribution: {row_text}{overflow_text}"
         )
+
+    def append_log(self, message):
+        self.log_area.append(message)
+        cursor = self.log_area.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.log_area.setTextCursor(cursor)
+        self.log_area.ensureCursorVisible()
+        QApplication.processEvents()
+
+    @staticmethod
+    def format_seconds(seconds):
+        seconds = max(0, int(seconds))
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        s = seconds % 60
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def get_video_duration(self, path):
+        try:
+            cmd = [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return float(result.stdout.strip())
+        except Exception:
+            return None
 
     def process_video(self):
         if not self.files:
@@ -304,16 +393,31 @@ class VideoTool(QMainWindow):
 
         self.last_output_dir = os.path.dirname(save_path)
         self.start_btn.setEnabled(False)
-        self.log_area.setText("Encoding...")
+        self.log_area.clear()
 
         metrics = self.get_layout_metrics()
         num = len(self.files)
         rows = metrics["rows"]
         cols_per_row = metrics["cols_per_row"]
+        row_counts = metrics["row_counts"]
         tile_h = metrics["tile_h"]
         tile_w = metrics["tile_w"]
         header_h = metrics["header_h"]
         box_h = metrics["box_h"]
+
+        if metrics["overflow"] > 0:
+            self.log_area.append(
+                f"\nERROR: Current layout can fit only {rows * metrics['max_per_row']} clip(s). "
+                f"Reduce clips, increase Max per Row, or use more rows."
+            )
+            self.start_btn.setEnabled(True)
+            return
+
+        if metrics["canvas_w"] > 16384 or metrics["canvas_h"] > 16384:
+            self.log_area.append(
+                "\nWARNING: Very large output dimensions may fail on some ffmpeg/NVENC builds. "
+                "Try fewer rows, lower Output Height, or use Final Canvas Height mode."
+            )
 
         font_size = self.font_spin.value()
         fit_mode = self.fit_combo.currentText()
@@ -378,24 +482,37 @@ class VideoTool(QMainWindow):
             filters.append(base + f"[v{i}]")
 
         row_labels = []
-        for r in range(rows):
-            start = r * cols_per_row
-            end = min((r + 1) * cols_per_row, num)
-            count = end - start
+        start = 0
+        for r, count in enumerate(row_counts):
+            end = start + count
             vids = "".join([f"[v{i}]" for i in range(start, end)])
 
-            if count == cols_per_row:
-                filters.append(f"{vids}hstack=inputs={count}:shortest=1[r{r}]")
+            if count > 1:
+                filters.append(f"{vids}hstack=inputs={count}:shortest=1[rowtmp{r}]")
             else:
-                full_row_w = tile_w * cols_per_row
-                filters.append(f"{vids}pad=w={full_row_w}:h={box_h}:x=(ow-iw)/2:y=0:color=black[r{r}]")
+                filters.append(f"{vids}null[rowtmp{r}]")
+
+            full_row_w = tile_w * cols_per_row
+            if count < cols_per_row:
+                filters.append(f"[rowtmp{r}]pad=w={full_row_w}:h={box_h}:x=(ow-iw)/2:y=0:color=black[r{r}]")
+            else:
+                filters.append(f"[rowtmp{r}]null[r{r}]")
+
             row_labels.append(f"[r{r}]")
+            start = end
 
         f_graph = ";".join(filters)
         if len(row_labels) > 1:
             f_graph += f";{''.join(row_labels)}vstack=inputs={len(row_labels)}:shortest=1[outv]"
         else:
             f_graph += f";{row_labels[0]}null[outv]"
+
+        durations = []
+        for f in self.files:
+            d = self.get_video_duration(f)
+            if d is not None:
+                durations.append(d)
+        total_duration = min(durations) if durations else None
 
         self.last_cmd = (
             f'ffmpeg -y {inputs} -filter_complex "{f_graph}" -map "[outv]" '
@@ -404,16 +521,88 @@ class VideoTool(QMainWindow):
         )
 
         try:
-            result = subprocess.run(self.last_cmd, shell=True, capture_output=True, text=True)
+            self.append_log("Starting encode...")
+            self.append_log(f"Output: {save_path}")
+            self.append_log(f"Clips loaded: {len(self.files)}")
+            if total_duration is not None:
+                self.append_log(f"Estimated output duration: {self.format_seconds(total_duration)}")
+            self.append_log("")
+
+            process = subprocess.Popen(
+                self.last_cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+
+            progress_state = {}
+            last_status_time = 0.0
+
+            while True:
+                line = process.stdout.readline()
+                if line == "" and process.poll() is not None:
+                    break
+                if not line:
+                    QApplication.processEvents()
+                    continue
+
+                line = line.strip()
+                if not line:
+                    continue
+
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    progress_state[key.strip()] = value.strip()
+
+                    now = time.time()
+                    if key.strip() == "progress":
+                        out_time_ms = progress_state.get("out_time_ms")
+                        fps = progress_state.get("fps", "?")
+                        speed = progress_state.get("speed", "?")
+
+                        if out_time_ms:
+                            try:
+                                current_seconds = float(out_time_ms) / 1_000_000.0
+                            except Exception:
+                                current_seconds = 0.0
+                        else:
+                            current_seconds = 0.0
+
+                        if total_duration and total_duration > 0:
+                            pct = min(100.0, (current_seconds / total_duration) * 100.0)
+                            status = (
+                                f"Progress: {pct:6.2f}%   "
+                                f"Time: {self.format_seconds(current_seconds)} / {self.format_seconds(total_duration)}   "
+                                f"FPS: {fps}   Speed: {speed}"
+                            )
+                        else:
+                            status = (
+                                f"Progress: Time {self.format_seconds(current_seconds)}   "
+                                f"FPS: {fps}   Speed: {speed}"
+                            )
+
+                        # Avoid flooding too hard, but still show the whole progress history.
+                        if now - last_status_time >= 0.5 or value.strip() == "end":
+                            self.append_log(status)
+                            last_status_time = now
+                else:
+                    self.append_log(line)
+
+            return_code = process.wait()
             self.start_btn.setEnabled(True)
-            if result.returncode == 0:
-                self.log_area.append("\nSUCCESS.")
+
+            if return_code == 0:
+                self.append_log("")
+                self.append_log("Completed.")
                 self.open_folder_btn.setVisible(True)
                 self.copy_btn.setVisible(True)
             else:
-                self.log_area.append(f"\nERROR:\n{result.stderr}")
+                self.append_log("")
+                self.append_log(f"ERROR: ffmpeg exited with code {return_code}")
         except Exception as e:
-            self.log_area.append(f"\nSystem Error: {str(e)}")
+            self.append_log(f"System Error: {str(e)}")
             self.start_btn.setEnabled(True)
 
 
